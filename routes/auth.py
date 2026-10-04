@@ -3,7 +3,9 @@ from flask import Blueprint, request, jsonify
 from db.mongo import users_collection
 import bcrypt
 import os
-from utils.auth import generate_token
+from utils.auth import generate_token, login_required
+from extensions import limiter
+from flask_limiter.util import get_remote_address
 
 auth = Blueprint("auth", __name__)
 
@@ -14,6 +16,7 @@ def db_available():
 
 # ─── REGISTER ─────────────────────────────────────────────────────────────────
 @auth.route("/register", methods=["POST"])
+@limiter.limit("5 per minute", key_func=get_remote_address)
 def register():
     if not db_available():
         return jsonify({"error": "Database not available"}), 503
@@ -48,6 +51,7 @@ def register():
 
 # ─── LOGIN ────────────────────────────────────────────────────────────────────
 @auth.route("/login", methods=["POST"])
+@limiter.limit("10 per minute", key_func=get_remote_address)
 def login():
     if not db_available():
         return jsonify({"error": "Database not available"}), 503
@@ -60,6 +64,8 @@ def login():
     if not user:
         return jsonify({"error": "User not found"}), 404
 
+    if not user.get("password"):
+        return jsonify({"error": "This account uses Google login"}), 400
     if not bcrypt.checkpw(data["password"].encode(), user["password"]):
         return jsonify({"error": "Wrong password"}), 401
 
@@ -88,6 +94,38 @@ def me():
     if not user:
         return jsonify({"error": "User not found"}), 404
     return jsonify(user)
+
+
+# ─── CHANGE PASSWORD ──────────────────────────────────────────────────────────
+@auth.route("/change-password", methods=["POST"])
+@login_required
+@limiter.limit("5 per minute")
+def change_password():
+    if not db_available():
+        return jsonify({"error": "Database not available"}), 503
+
+    data         = request.json or {}
+    old_password = data.get("old_password", "")
+    new_password = data.get("new_password", "")
+
+    if not old_password or not new_password:
+        return jsonify({"error": "Old and new password required"}), 400
+    if len(new_password) < 8:
+        return jsonify({"error": "New password must be at least 8 characters"}), 400
+    if old_password == new_password:
+        return jsonify({"error": "New password must be different"}), 400
+
+    user = users_collection.find_one({"email": request.user["email"]})
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    if not user.get("password"):
+        return jsonify({"error": "Google accounts have no password to change"}), 400
+    if not bcrypt.checkpw(old_password.encode(), user["password"]):
+        return jsonify({"error": "Wrong current password"}), 401
+
+    hashed_pw = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt())
+    users_collection.update_one({"_id": user["_id"]}, {"$set": {"password": hashed_pw}})
+    return jsonify({"success": True, "message": "Password updated"})
 
 
 # ─── GOOGLE LOGIN ─────────────────────────────────────────────────────────────

@@ -3,6 +3,8 @@ from flask import Blueprint, request, jsonify
 from groq import Groq
 import os
 from dotenv import load_dotenv
+from extensions import limiter
+from utils.auth import login_required
 
 load_dotenv()
 
@@ -25,6 +27,8 @@ SYSTEM_PROMPT = """You are NephroAI, an expert medical assistant specialized in 
 """
 
 @chat_bp.route('/chat', methods=['POST'])
+@login_required
+@limiter.limit("15 per minute; 200 per day")
 def chat_with_groq():
     try:
         data = request.json

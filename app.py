@@ -1,13 +1,17 @@
 # kidney-backend/app.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 import joblib
 import numpy as np
 import os
+import math
 from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
+# Railway/Render kaykhdmo b proxy — bach request.remote_addr ykon l'IP l7a9i9i
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 # FRONTEND_URL = domain(s) ديال Vercel مفرقين بفاصلة، مثلا: https://nephroai.vercel.app
 ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"] + [
     o.strip().rstrip("/") for o in os.getenv("FRONTEND_URL", "").split(",") if o.strip()
@@ -18,6 +22,11 @@ CORS(app, origins=ALLOWED_ORIGINS)
 def apply_headers(response):
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin-allow-popups"
     return response
+
+# ─── Rate limit + auth decorators ─────────────────────────────────────────────
+from extensions import limiter
+from utils.auth import role_required
+limiter.init_app(app)
 
 # ─── MongoDB — optional ───────────────────────────────────────────────────────
 try:
@@ -93,22 +102,24 @@ def decode_token(token):
     except Exception:
         return {}
 # ─── Helper: parse form input ─────────────────────────────────────────────────
-DEFAULTS = {
-    "age": 50.0, "bp": 120.0, "creatinine": 3.5, "urea": 35.0,
-    "hemoglobin": 13.5, "sodium": 138.0, "potassium": 4.0,
-    "protein": 0.0, "glucose": 100.0, "rbc": 0.0,
-    "diabetes": 0.0, "hypertension": 0.0,
-}
-
-def parse_input(data: dict) -> list:
-    row = []
+def parse_input(data: dict):
+    """Rj3 (row, missing). Ila chi champ khawi wla machi ra9m, kaydkhl f missing."""
+    row, missing = [], []
     for feat in FORM_FEATURES:
-        val = data.get(feat, "")
         try:
-            row.append(float(val))
+            val = float(data.get(feat, ""))
+            if math.isnan(val):
+                raise ValueError
+            row.append(val)
         except (ValueError, TypeError):
-            row.append(DEFAULTS.get(feat, 0.0))
-    return row
+            missing.append(feat)
+    return row, missing
+
+def missing_response(missing):
+    return jsonify({
+        "error":   f"Missing or invalid fields: {', '.join(missing)}",
+        "missing": missing,
+    }), 400
 
 def save_to_history(data, result, token=""):
     if not MONGO_ENABLED or history_collection is None:
@@ -151,13 +162,17 @@ def health():
     })
 
 @app.route("/predict", methods=["POST"])
+@role_required("doctor", "admin")
+@limiter.limit("30 per minute")
 def predict():
     try:
         data = request.get_json()
         if not data:
             return jsonify({"error": "No data received"}), 400
 
-        row      = parse_input(data)
+        row, missing = parse_input(data)
+        if missing:
+            return missing_response(missing)
         X_scaled = scaler.transform(np.array([row]))
         proba    = model.predict_proba(X_scaled)[0]
 
@@ -180,6 +195,8 @@ def predict():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/predict/xgboost", methods=["POST"])
+@role_required("doctor", "admin")
+@limiter.limit("30 per minute")
 def predict_xgboost():
     if xgb_model is None:
         return jsonify({"error": "XGBoost model not loaded — run: python train.py"}), 503
@@ -188,7 +205,9 @@ def predict_xgboost():
         if not data:
             return jsonify({"error": "No data received"}), 400
 
-        row      = parse_input(data)
+        row, missing = parse_input(data)
+        if missing:
+            return missing_response(missing)
         X_scaled = scaler.transform(np.array([row]))
         proba    = xgb_model.predict_proba(X_scaled)[0]
 
@@ -211,6 +230,8 @@ def predict_xgboost():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/upload", methods=["POST"])
+@role_required("doctor", "admin")
+@limiter.limit("30 per minute")
 def upload_file():
     try:
         if "file" not in request.files:
@@ -231,7 +252,9 @@ def upload_file():
             val = raw.get(dataset_col, raw.get(form_key, ""))
             inputs[form_key] = str(val) if val != "" else ""
 
-        row      = parse_input(inputs)
+        row, missing = parse_input(inputs)
+        if missing:
+            return missing_response(missing)
         X_scaled = scaler.transform(np.array([row]))
         proba    = xgb_model.predict_proba(X_scaled)[0] if xgb_model else model.predict_proba(X_scaled)[0]
 
@@ -254,6 +277,7 @@ def upload_file():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/history", methods=["GET"])
+@role_required("admin")
 def history():
     if not MONGO_ENABLED or history_collection is None:
         return jsonify({"error": "MongoDB not connected"}), 503
@@ -299,37 +323,7 @@ def my_history():
     except Exception as e:
         print(f"❌ my-history error: {str(e)}")
         return jsonify({"error": str(e)}), 500
-    if not MONGO_ENABLED or history_collection is None:
-        return jsonify({"error": "MongoDB not connected"}), 503
-    try:
-        token   = get_token()
-        decoded = decode_token(token)
-        email   = decoded.get("email", "")
-        role    = decoded.get("role", "patient")
 
-        print(f"📋 my-history — email: '{email}' role: '{role}'")
-
-        if role in ["admin", "doctor"]:
-            # الدكتور والـ admin يشوفو كل الـ predictions
-            records = list(
-                history_collection.find({}, {"_id": 0})
-                .sort("date", -1).limit(100)
-            )
-        elif email:
-            # المريض يشوف predictions ديالو فقط
-            records = list(
-                history_collection.find({"user_email": email}, {"_id": 0})
-                .sort("date", -1).limit(50)
-            )
-        else:
-            records = []
-
-        print(f"📋 Found {len(records)} records")
-        return jsonify(records)
-
-    except Exception as e:
-        print(f"❌ my-history error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
 @app.route("/stats", methods=["GET"])
 def stats():
     try:
@@ -556,7 +550,6 @@ def doctor_create_patient():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/admin/stats", methods=["GET"])
 @app.route("/admin/stats", methods=["GET"])
 def admin_stats():
     if not MONGO_ENABLED:
